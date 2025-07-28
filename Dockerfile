@@ -6,7 +6,7 @@ RUN apk add --no-cache git musl-dev openssl-dev pkgconfig build-base
 	
 WORKDIR /usr/src
 	
-RUN git clone --filter=blob:none --sparse https://github.com/cyb0124/CCRemote.git \
+RUN git clone --filter=blob:none --sparse https://github.com/Brickmaster1/CCRemote.git \
     && cd CCRemote \
     && git sparse-checkout set server
 	
