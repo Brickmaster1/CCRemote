@@ -10,7 +10,7 @@ dump_traffic = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
-tokio-tungstenite = "0"
+tokio-tungstenite = "=0.24.0"
 abort-on-drop = "0"
 ordered-float = "4"
 futures-util = "0"
@@ -25,6 +25,7 @@ ratatui = "0.28.1"
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 tui-textarea = "0.6.1"
 regex = "1.10.4"
+notify = "6.1.1"
 
 [profile.dev]
 panic = "abort"

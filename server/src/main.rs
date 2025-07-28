@@ -36,7 +36,7 @@ use ratatui::{
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    io::stdout,
+    io::{self, Write},
     rc::Rc,
 };
 use tokio::{select, sync::Notify, task::LocalSet};
@@ -113,8 +113,39 @@ impl Tui {
     }
 }
 
+struct NonInteractiveTui {
+    logs: RefCell<VecDeque<String>>,
+}
+
+impl NonInteractiveTui {
+    fn new() -> Self {
+        Self {
+            logs: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    fn log(&self, msg: String, _color: u8) {
+        println!("{}", msg);
+        self.logs.borrow_mut().push_back(msg);
+        if self.logs.borrow().len() > 1000 {
+            self.logs.borrow_mut().pop_front();
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Try to determine if we're running in an interactive terminal
+    let is_interactive = crossterm::terminal::is_terminal(io::stdout());
+
+    if is_interactive {
+        run_interactive().await;
+    } else {
+        run_noninteractive().await;
+    }
+}
+
+async fn run_interactive() {
     let tasks = LocalSet::new();
     tasks.spawn_local(async {
         enable_raw_mode().unwrap();
@@ -155,5 +186,24 @@ async fn main() {
         disable_raw_mode().unwrap();
         stdout().execute(LeaveAlternateScreen).unwrap();
     });
-    tasks.await
+    tasks.await;
+}
+
+async fn run_noninteractive() {
+    let tui = Rc::new(NonInteractiveTui::new());
+    println!("Starting CCRemote in non-interactive mode...");
+    
+    // Load config and start factory
+    let factory = match std::env::var("CONFIG_PATH") {
+        Ok(path) => build_factory_from_json(tui, &path),
+        Err(_) => {
+            println!("No CONFIG_PATH specified, using default configuration");
+            build_factory(tui)
+        }
+    };
+
+    // Keep the application running
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
