@@ -18,7 +18,7 @@ pub mod server;
 pub mod storage;
 pub mod turtle_rc;
 
-use config::build_factory_from_json;
+use config::build_factory;
 use crossterm::{
     event::{Event, EventStream},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -34,32 +34,28 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
+    cell::{Cell, RefCell},
     collections::VecDeque,
-    io::{stdout},
-    sync::{Arc, Mutex},
-    time::Duration,
+    io::{self, Write},
+    rc::Rc,
 };
-use tokio::{select, sync::Notify};
+use tokio::{select, sync::Notify, task::LocalSet};
 use tui_textarea::{CursorMove, Input, Key, TextArea};
-use atty::Stream;
-
-pub trait UiTrait: Send + Sync {
-    fn log(&self, msg: String, color: u8);
-}
 
 #[derive(Default)]
 pub struct Tui {
     on_redraw: Notify,
     on_input: Notify,
-    logs: Mutex<VecDeque<Line<'static>>>,
-    input_queue: Mutex<Vec<String>>,
-    text_area: Mutex<TextArea<'static>>,
-    main_list: Mutex<Vec<Line<'static>>>,
-    main_scroll: Mutex<u16>,
-    main_scroll_state: Mutex<ScrollbarState>,
+    logs: RefCell<VecDeque<Line<'static>>>,
+    input_queue: RefCell<Vec<String>>,
+    text_area: RefCell<TextArea<'static>>,
+    main_list: RefCell<Vec<Line<'static>>>,
+    main_scroll: Cell<u16>,
+    main_scroll_state: RefCell<ScrollbarState>,
 }
 
-impl UiTrait for Tui {
+impl Tui {
+    fn request_redraw(&self) { self.on_redraw.notify_one() }
     fn log(&self, msg: String, color: u8) {
         let color = match color {
             0 => Color::Reset,
@@ -71,88 +67,78 @@ impl UiTrait for Tui {
             14 => Color::Red,
             _ => unreachable!(),
         };
-        let mut logs = self.logs.lock().unwrap();
-        logs.push_back(Line::styled(msg, color));
-        self.on_redraw.notify_one();
+        self.logs.borrow_mut().push_back(Line::styled(msg, color));
+        self.request_redraw()
     }
-}
-
-impl Tui {
-    fn request_redraw(&self) { self.on_redraw.notify_one(); }
 
     fn set_main_list(&self, list: Vec<Line<'static>>) {
-        let mut main_list = self.main_list.lock().unwrap();
-        *main_list = list;
-        let mut scroll = self.main_scroll.lock().unwrap();
-        *scroll = scroll.min(main_list.len().max(1) as u16 - 1);
-        let mut state = self.main_scroll_state.lock().unwrap();
-        *state = state.position(*scroll as usize).content_length(main_list.len());
-        self.request_redraw();
+        *self.main_list.borrow_mut() = list;
+        self.set_main_scroll(|x| x)
     }
 
     fn set_main_scroll(&self, upd: impl FnOnce(u16) -> u16) {
-        let list = self.main_list.lock().unwrap();
-        let mut scroll = self.main_scroll.lock().unwrap();
-        *scroll = upd(*scroll).min(list.len().max(1) as u16 - 1);
-        let mut state = self.main_scroll_state.lock().unwrap();
-        *state = state.position(*scroll as usize).content_length(list.len());
+        let list = self.main_list.borrow();
+        let i = upd(self.main_scroll.get());
+        self.main_scroll.set(i.min(list.len().max(1) as u16 - 1));
+        let mut state = self.main_scroll_state.borrow_mut();
+        *state = state.position(i as _).content_length(list.len())
     }
 
     fn frame(&self, frame: &mut Frame) {
         let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame.area());
-        frame.render_widget(&*self.text_area.lock().unwrap(), layout[1]);
+        frame.render_widget(&*self.text_area.borrow(), layout[1]);
 
         let log_size;
-        let main_list = self.main_list.lock().unwrap();
+        let main_list = self.main_list.borrow();
         if main_list.is_empty() {
-            log_size = layout[0];
+            log_size = layout[0]
         } else {
             let layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).split(layout[0]);
             log_size = layout[0];
             let main_list_size = layout[1];
-            frame.render_widget(Paragraph::new(main_list.clone()).scroll((*self.main_scroll.lock().unwrap(), 0)), main_list_size);
+            frame.render_widget(Paragraph::new(main_list.clone()).scroll((self.main_scroll.get(), 0)), main_list_size);
             let scroll = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             frame.render_stateful_widget(
                 scroll,
                 main_list_size.inner(Margin { horizontal: 1, vertical: 0 }),
-                &mut *self.main_scroll_state.lock().unwrap(),
-            );
+                &mut *self.main_scroll_state.borrow_mut(),
+            )
         }
 
-        let mut log_buffer = self.logs.lock().unwrap();
+        let mut log_buffer = self.logs.borrow_mut();
         while log_buffer.len() > log_size.height as _ {
             log_buffer.pop_front();
         }
-        frame.render_widget(Paragraph::new(Vec::from_iter(log_buffer.iter().cloned())), log_size);
+        frame.render_widget(Paragraph::new(Vec::from_iter(log_buffer.iter().cloned())), log_size)
     }
 }
 
-pub struct NonInteractiveTui {
-    logs: Mutex<VecDeque<String>>,
+struct NonInteractiveTui {
+    logs: RefCell<VecDeque<String>>,
 }
 
 impl NonInteractiveTui {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            logs: Mutex::new(VecDeque::new()),
+            logs: RefCell::new(VecDeque::new()),
         }
     }
-}
 
-impl UiTrait for NonInteractiveTui {
     fn log(&self, msg: String, _color: u8) {
         println!("{}", msg);
-        let mut logs = self.logs.lock().unwrap();
-        logs.push_back(msg);
-        if logs.len() > 1000 {
-            logs.pop_front();
+        self.logs.borrow_mut().push_back(msg);
+        if self.logs.borrow().len() > 1000 {
+            self.logs.borrow_mut().pop_front();
         }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if atty::is(Stream::Stdout) {
+    // Try to determine if we're running in an interactive terminal
+    let is_interactive = crossterm::terminal::is_terminal(io::stdout());
+
+    if is_interactive {
         run_interactive().await;
     } else {
         run_noninteractive().await;
@@ -160,52 +146,63 @@ async fn main() {
 }
 
 async fn run_interactive() {
-    enable_raw_mode().unwrap();
-    stdout().execute(EnterAlternateScreen).unwrap();
-    let mut evts = EventStream::new();
-    let mut term = Terminal::new(CrosstermBackend::new(std::io::stderr())).unwrap();
-    let tui = Arc::new(Tui::default());
-    let factory = build_factory_from_json(tui.clone() as Arc<dyn UiTrait>, "config.json");
-    let factory_ref = Arc::new(Mutex::new(Some(factory)));
-    config::start_factory_hot_reload(tui.clone() as Arc<dyn UiTrait>, "config.json", factory_ref.clone());
-    loop {
-        term.draw(|frame| tui.frame(frame)).unwrap();
-        let evt = select! {
-            () = tui.on_redraw.notified() => None,
-            evt = evts.next() => if let Some(Ok(x)) = evt { Some(x) } else { break }
-        };
-        if let Some(Event::Key(evt)) = evt {
-            let evt = Input::from(evt);
-            if evt.ctrl && (evt.key == Key::Char('c') || evt.key == Key::Char('d')) {
-                break;
-            } else if evt.ctrl && evt.key == Key::Char('l') {
-                let mut logs = tui.logs.lock().unwrap();
-                logs.clear();
-            } else if evt.key == Key::PageUp {
-                let mut scroll = tui.main_scroll.lock().unwrap();
-                *scroll = scroll.saturating_sub(8);
-            } else if evt.key == Key::PageDown {
-                let mut scroll = tui.main_scroll.lock().unwrap();
-                *scroll = scroll.saturating_add(8);
-            } else if evt.ctrl && evt.key == Key::Char('m') || evt.key == Key::Enter {
-                let mut text_area = tui.text_area.lock().unwrap();
-                let line = text_area.lines().get(text_area.cursor().0).cloned().unwrap_or_default();
-                tui.input_queue.lock().unwrap().push(line);
-                text_area.move_cursor(CursorMove::End);
-                text_area.insert_newline();
-            } else {
-                tui.text_area.lock().unwrap().input(evt);
+    let tasks = LocalSet::new();
+    tasks.spawn_local(async {
+        enable_raw_mode().unwrap();
+        stdout().execute(EnterAlternateScreen).unwrap();
+        let mut evts = EventStream::new();
+        let mut term = Terminal::new(CrosstermBackend::new(std::io::stderr())).unwrap();
+        let tui = Rc::<Tui>::default();
+        // To run turtle_rc, replace with:
+        // let _factory = turtle_rc::run(server::Server::new(tui.clone(), 1848));
+        let _factory = build_factory(tui.clone());
+        loop {
+            term.draw(|frame| tui.frame(frame)).unwrap();
+            let evt = select! {
+                () = tui.on_redraw.notified() => None,
+                evt = evts.next() => if let Some(Ok(x)) = evt { Some(x) } else { break }
+            };
+            if let Some(Event::Key(evt)) = evt {
+                let evt = Input::from(evt);
+                if evt.ctrl && (evt.key == Key::Char('c') || evt.key == Key::Char('d')) {
+                    break;
+                } else if evt.ctrl && evt.key == Key::Char('l') {
+                    tui.logs.borrow_mut().clear()
+                } else if evt.key == Key::PageUp {
+                    tui.set_main_scroll(|x| x.saturating_sub(8))
+                } else if evt.key == Key::PageDown {
+                    tui.set_main_scroll(|x| x.saturating_add(8))
+                } else if evt.ctrl && evt.key == Key::Char('m') || evt.key == Key::Enter {
+                    let mut text_area = tui.text_area.borrow_mut();
+                    tui.input_queue.borrow_mut().extend(text_area.lines().get(text_area.cursor().0).cloned());
+                    text_area.move_cursor(CursorMove::End);
+                    text_area.insert_newline()
+                } else {
+                    tui.text_area.borrow_mut().input(evt);
+                }
+                tui.on_input.notify_waiters()
             }
-            tui.on_input.notify_waiters();
         }
-    }
-    disable_raw_mode().unwrap();
-    stdout().execute(LeaveAlternateScreen).unwrap();
+        disable_raw_mode().unwrap();
+        stdout().execute(LeaveAlternateScreen).unwrap();
+    });
+    tasks.await;
 }
 
 async fn run_noninteractive() {
-    let tui = Arc::new(NonInteractiveTui::new()) as Arc<dyn UiTrait>;
-    let factory = build_factory_from_json(tui.clone(), "config.json");
+    let tui = Rc::new(NonInteractiveTui::new());
+    println!("Starting CCRemote in non-interactive mode...");
+    
+    // Load config and start factory
+    let factory = match std::env::var("CONFIG_PATH") {
+        Ok(path) => build_factory_from_json(tui, &path),
+        Err(_) => {
+            println!("No CONFIG_PATH specified, using default configuration");
+            build_factory(tui)
+        }
+    };
+
+    // Keep the application running
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
