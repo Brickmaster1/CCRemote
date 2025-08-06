@@ -26,6 +26,7 @@ crossterm = { version = "0.28.1", features = ["event-stream"] }
 tui-textarea = "0.6.1"
 regex = "1.10.4"
 notify = "6.1.1"
+atty = "0.2"
 
 [profile.dev]
 panic = "abort"

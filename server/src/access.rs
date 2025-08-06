@@ -42,7 +42,7 @@ pub struct RedstoneAccess {
     pub client: LocalStr,
     pub addr: Option<LocalStr>,
     pub side: LocalStr,
-    pub bit: Option<u8>, // for bundled cable only
+    pub bit: Option<u8>,
 }
 
 pub const BOTTOM: &str = "bottom";
@@ -75,6 +75,7 @@ impl_get_client!(FluidAccess);
 pub struct FluidAccess {
     pub client: LocalStr,
     pub fluid_bus_addrs: Vec<LocalStr>,
+    pub tank_addr: LocalStr,
 }
 
 impl_get_client!(TankAccess);
